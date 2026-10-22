@@ -1,0 +1,9 @@
+# Build output
+build/
+
+# Logs and local secrets
+*.log
+.env*
+
+# macOS
+.DS_Store
