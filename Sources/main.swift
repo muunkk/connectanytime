@@ -41,10 +41,36 @@ struct Prefs {
             guard let r = xml.range(of: "(?<=<\(name)>)[^<]+", options: .regularExpression) else { return nil }
             return String(xml[r])
         }
-        if let h = tag("DefaultHostName") { p.host = h }
+        if let h = serverAddress(name: tag("DefaultHostName"), address: tag("DefaultHostAddress"), profiles: ciscoProfiles()) { p.host = h }
         if let u = tag("DefaultUser") { p.user = u }
         return p
     }
+}
+
+/// Cisco saves the server you picked by its display name when it comes from a VPN profile
+/// (e.g. "3 - Shanghai VPN"), which the CLI can't connect to. Resolve it to the address.
+func serverAddress(name: String?, address: String?, profiles: [String]) -> String? {
+    func trimmed(_ s: String?) -> String? {
+        s.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+    }
+    if let address = trimmed(address) { return address }
+    guard let name = trimmed(name) else { return nil }
+    for xml in profiles {
+        for entry in xml.components(separatedBy: "<HostEntry>").dropFirst() {
+            func field(_ tag: String) -> String? {
+                trimmed(entry.range(of: "(?<=<\(tag)>)[^<]+", options: .regularExpression).map { String(entry[$0]) })
+            }
+            if field("HostName") == name { return field("HostAddress") ?? name }
+        }
+    }
+    return name.contains(where: \.isWhitespace) ? nil : name
+}
+
+/// VPN profiles installed by the organisation (XML), used to look up server addresses.
+func ciscoProfiles() -> [String] {
+    let dir = "/opt/cisco/secureclient/vpn/profile"
+    let files = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+    return files.filter { $0.hasSuffix(".xml") }.compactMap { try? String(contentsOfFile: dir + "/" + $0, encoding: .utf8) }
 }
 
 // MARK: - Keychain
@@ -131,7 +157,7 @@ func staleServerRoute(_ host: String) -> String? {
     func field(_ out: String, _ name: String) -> String? {
         out.range(of: "(?<=\(name): )\\S+", options: .regularExpression).map { String(out[$0]) }
     }
-    let server = run("/sbin/route", ["-n", "get", host])
+    let server = run("/sbin/route", ["-n", "get", String(host.split(separator: "/").first ?? "")])
     let current = run("/sbin/route", ["-n", "get", "default"])
     guard let dest = field(server, "destination"), dest.range(of: "^\\d{1,3}(\\.\\d{1,3}){3}$", options: .regularExpression) != nil,
           let gw = field(server, "gateway"), let currentGW = field(current, "gateway"), gw != currentGW else { return nil }
