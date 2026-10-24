@@ -122,6 +122,27 @@ func routerAddress(on interface: String) -> String? {
     return arp.range(of: "(?<= at )[0-9a-f]{1,2}(:[0-9a-f]{1,2}){5}", options: .regularExpression).map { String(arp[$0]) }
 }
 
+/// A host route to the VPN server through a router other than the current one.
+/// Cisco pins the server to the router it connected through; an interrupted reconnect
+/// can leave that route behind after a network change, and then the server is unreachable.
+/// Returns the route's destination address.
+func staleServerRoute(_ host: String) -> String? {
+    func field(_ out: String, _ name: String) -> String? {
+        out.range(of: "(?<=\(name): )\\S+", options: .regularExpression).map { String(out[$0]) }
+    }
+    let server = run("/sbin/route", ["-n", "get", host])
+    let current = run("/sbin/route", ["-n", "get", "default"])
+    guard let dest = field(server, "destination"), dest.range(of: "^\\d{1,3}(\\.\\d{1,3}){3}$", options: .regularExpression) != nil,
+          let gw = field(server, "gateway"), let currentGW = field(current, "gateway"), gw != currentGW else { return nil }
+    return dest
+}
+
+/// Deletes the route after the standard macOS admin password prompt.
+func removeRoute(_ dest: String) {
+    let script = "do shell script \"/sbin/route -n delete \(dest)\" with prompt \"ConnectAnytime needs to remove a stale route to the VPN server.\" with administrator privileges"
+    run("/usr/bin/osascript", ["-e", script])
+}
+
 // MARK: - Interactive connect
 
 /// Runs `vpn` interactively on a pty and answers each prompt exactly once.
@@ -286,6 +307,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var currentRouter: String?
 
     var isConnected: Bool { state == "Connected" }
+    /// Connected or on the way there, including Cisco's own reconnects after a network change.
+    var isActive: Bool { !["Disconnected", "Unknown"].contains(state) }
 
     var savedNetworks: [SavedNetwork] {
         get {
@@ -321,7 +344,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             switch cmd {
             case "connect": connect()
             case "disconnect": disconnect()
-            case "toggle": isConnected ? disconnect() : connect()
+            case "toggle": isActive ? disconnect() : connect()
             default: break
             }
         }
@@ -362,7 +385,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: busy ?? state, action: nil, keyEquivalent: "")
         menu.addItem(.separator())
         if busy == nil {
-            if isConnected { add("Disconnect", #selector(disconnect)) }
+            if isActive { add("Disconnect", #selector(disconnect)) }
             else { add("Connect", #selector(connect)) }
         } else if session != nil {
             add("Cancel", #selector(cancelConnect))
@@ -392,7 +415,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Actions
 
     @objc func connect() {
-        guard busy == nil, !isConnected else { return }
+        guard busy == nil, !isActive else { return }
         guard !prefs.user.isEmpty else {
             notify("No Cisco username found", "Connect once with Cisco Secure Client so it remembers your username.")
             return
@@ -404,6 +427,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setBusy("Connecting…")
         log("app: connect requested")
         DispatchQueue.global().async {
+            if let dest = staleServerRoute(self.prefs.host) {
+                log("app: stale route to the server, asking to remove it")
+                removeRoute(dest)
+                if staleServerRoute(self.prefs.host) != nil {
+                    log("app: stale route still there")
+                    return DispatchQueue.main.async {
+                        self.setBusy(nil)
+                        self.notify("Can't reach the VPN server", "Turn Wi-Fi off and on, then connect again.")
+                    }
+                }
+            }
             self.quitCiscoGUI()
             let s = ConnectSession(
                 host: self.prefs.host, user: self.prefs.user, password: password,
