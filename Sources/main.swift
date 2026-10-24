@@ -286,6 +286,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var currentRouter: String?
 
     var isConnected: Bool { state == "Connected" }
+    /// Connected or on the way there, including Cisco's own reconnects after a network change.
+    var isActive: Bool { !["Disconnected", "Unknown"].contains(state) }
 
     var savedNetworks: [SavedNetwork] {
         get {
@@ -321,7 +323,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             switch cmd {
             case "connect": connect()
             case "disconnect": disconnect()
-            case "toggle": isConnected ? disconnect() : connect()
+            case "toggle": isActive ? disconnect() : connect()
             default: break
             }
         }
@@ -362,7 +364,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: busy ?? state, action: nil, keyEquivalent: "")
         menu.addItem(.separator())
         if busy == nil {
-            if isConnected { add("Disconnect", #selector(disconnect)) }
+            if isActive { add("Disconnect", #selector(disconnect)) }
             else { add("Connect", #selector(connect)) }
         } else if session != nil {
             add("Cancel", #selector(cancelConnect))
@@ -392,7 +394,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Actions
 
     @objc func connect() {
-        guard busy == nil, !isConnected else { return }
+        guard busy == nil, !isActive else { return }
         guard !prefs.user.isEmpty else {
             notify("No Cisco username found", "Connect once with Cisco Secure Client so it remembers your username.")
             return
