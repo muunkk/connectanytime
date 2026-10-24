@@ -31,8 +31,9 @@ It doesn't replace Cisco Secure Client. It drives Cisco's own command-line clien
 - Stored in your macOS Keychain. Other apps must ask your permission to read it.
 - Sent only to Cisco's client, through a private terminal session. Never written to a file,
   a log, a command line or the clipboard.
-- The app makes no internet connections of its own. Its only network traffic is one ping to
-  your router, to identify the network for auto-connect.
+- The app's own network traffic is a ping to your router, to identify the network for
+  auto-connect, and the daily update check, a plain request to GitHub for the latest
+  release (no account, usage or network details).
 - Your username comes from Cisco Secure Client's saved settings (`~/.vpn/.anyconnect`), so
   connect once with Cisco's app first.
 
@@ -52,6 +53,16 @@ Requires macOS 13+ (Apple Silicon or Intel) and Cisco Secure Client.
 4. Click the globe in the menu bar, then **Connect**. It asks for your NYU password once.
 
 Optional: turn on **Launch at Login** in the menu.
+
+## Updates
+
+The app checks GitHub for a new release once a day and shows **Update to x.y.z…** in the
+menu when there is one (or choose **Check for Updates…**). Installing downloads the
+release's `ConnectAnytime.zip`, checks it against the SHA-256 GitHub publishes for it, checks
+the app inside is intact (bundle ID, version, code signature), then swaps it in and restarts.
+Like a manual download, this trusts this GitHub repository. The VPN
+connection isn't touched. After an update macOS may ask whether the app can use its Keychain
+item: choose **Always Allow**.
 
 ## Build from source
 
