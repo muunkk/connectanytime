@@ -1,6 +1,7 @@
 // ConnectAnytime: a menu-bar Connect/Disconnect for Cisco Secure Client.
 // Drives Cisco's own CLI over a pty; the password goes Keychain -> pty, nowhere else.
 import AppKit
+import CryptoKit
 import Network
 import Security
 import ServiceManagement
@@ -293,6 +294,98 @@ final class ConnectSession {
     }
 }
 
+// MARK: - Updates (GitHub releases, no update framework)
+
+let latestReleaseAPI = URL(string: "https://api.github.com/repos/muunkk/connectanytime/releases/latest")!
+let releaseDownloadPrefix = "https://github.com/muunkk/connectanytime/releases/download/"
+
+struct Release {
+    var version: String
+    var zip: URL
+    var sha256: String // published by GitHub for the asset
+    var page: URL
+}
+
+private struct GitHubRelease: Decodable {
+    struct Asset: Decodable { let name: String; let browser_download_url: URL; let digest: String? }
+    let tag_name: String
+    let html_url: URL
+    let assets: [Asset]
+}
+
+/// Numeric dotted versions: "0.1.10" is newer than "0.1.9".
+func isVersion(_ a: String, newerThan b: String) -> Bool {
+    let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(x.count, y.count) where (i < x.count ? x[i] : 0) != (i < y.count ? y[i] : 0) {
+        return (i < x.count ? x[i] : 0) > (i < y.count ? y[i] : 0)
+    }
+    return false
+}
+
+func fetchLatestRelease() async throws -> Release {
+    var req = URLRequest(url: latestReleaseAPI, timeoutInterval: 20)
+    req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    let (data, resp) = try await URLSession.shared.data(for: req)
+    guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw UpdateError("GitHub didn't answer. Try again later.") }
+    let r = try JSONDecoder().decode(GitHubRelease.self, from: data)
+    let version = r.tag_name.hasPrefix("v") ? String(r.tag_name.dropFirst()) : r.tag_name
+    guard version.range(of: "^\\d+(\\.\\d+)*$", options: .regularExpression) != nil,
+          let asset = r.assets.first(where: { $0.name == "ConnectAnytime.zip" }),
+          asset.browser_download_url.absoluteString.hasPrefix(releaseDownloadPrefix),
+          let digest = asset.digest, digest.range(of: "^sha256:[0-9a-f]{64}$", options: .regularExpression) != nil
+    else { throw UpdateError("The latest release doesn't have a verifiable ConnectAnytime.zip.") }
+    return Release(version: version, zip: asset.browser_download_url, sha256: String(digest.dropFirst(7)), page: r.html_url)
+}
+
+struct UpdateError: LocalizedError {
+    let errorDescription: String?
+    init(_ message: String) { errorDescription = message }
+}
+
+/// Downloads and checks the release, then swaps it in for the running app.
+/// The zip must match GitHub's SHA-256 for it; the app inside must have our bundle ID, the
+/// release's version and an intact code signature. Nothing is replaced unless all pass.
+func installUpdate(_ release: Release) async throws {
+    let (download, _) = try await URLSession.shared.download(from: release.zip)
+    defer { try? FileManager.default.removeItem(at: download) }
+    let hash = SHA256.hash(data: try Data(contentsOf: download)).map { String(format: "%02x", $0) }.joined()
+    guard hash == release.sha256 else { throw UpdateError("The download didn't match GitHub's checksum.") }
+
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ConnectAnytime-update-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    guard succeeds("/usr/bin/ditto", ["-x", "-k", download.path, dir.path]) else { throw UpdateError("Couldn't unzip the update.") }
+
+    let newApp = dir.appendingPathComponent("ConnectAnytime.app")
+    guard let info = Bundle(url: newApp)?.infoDictionary,
+          info["CFBundleIdentifier"] as? String == Bundle.main.bundleIdentifier,
+          let version = info["CFBundleShortVersionString"] as? String,
+          !isVersion(version, newerThan: release.version), !isVersion(release.version, newerThan: version),
+          succeeds("/usr/bin/codesign", ["--verify", "--deep", "--strict", newApp.path])
+    else { throw UpdateError("The update didn't pass its checks.") }
+
+    _ = try FileManager.default.replaceItemAt(Bundle.main.bundleURL, withItemAt: newApp)
+}
+
+/// Starts the app again once this process has exited.
+func relaunchAfterExit() {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/sh")
+    p.arguments = ["-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"$2\"", "sh",
+                   String(ProcessInfo.processInfo.processIdentifier), Bundle.main.bundlePath]
+    try? p.run()
+}
+
+func succeeds(_ path: String, _ args: [String]) -> Bool {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return false }
+    p.waitUntilExit()
+    return p.terminationStatus == 0
+}
+
 // MARK: - App
 
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -305,6 +398,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let pathMonitor = NWPathMonitor()
     var networkCheck: DispatchWorkItem?
     var currentRouter: String?
+    var availableUpdate: Release?
 
     var isConnected: Bool { state == "Connected" }
     /// Connected or on the way there, including Cisco's own reconnects after a network change.
@@ -330,6 +424,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         log("app: launched")
         listenForCommands()
         watchNetwork()
+        checkForUpdatesQuietly()
+        Timer.scheduledTimer(withTimeInterval: 24 * 60 * 60, repeats: true) { [weak self] _ in self?.checkForUpdatesQuietly() }
     }
 
     func applicationWillTerminate(_ n: Notification) {
@@ -396,6 +492,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("Open Cisco Secure Client", #selector(openCisco))
         let login = add("Launch at Login", #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        add(availableUpdate.map { "Update to \($0.version)…" } ?? "Check for Updates…", #selector(checkForUpdates))
         menu.addItem(.separator())
         add("Quit", #selector(NSApplication.terminate(_:)), target: NSApp)
     }
@@ -607,6 +704,76 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let svc = SMAppService.mainApp
         do { svc.status == .enabled ? try svc.unregister() : try svc.register() }
         catch { notify("Launch at Login failed", error.localizedDescription) }
+    }
+
+    // MARK: Updates
+
+    var currentVersion: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0" }
+
+    /// Daily background check: updates the menu item and notifies once per new version.
+    func checkForUpdatesQuietly() {
+        Task { @MainActor in
+            guard let r = try? await fetchLatestRelease(), isVersion(r.version, newerThan: currentVersion) else { return }
+            if availableUpdate?.version != r.version {
+                notify("ConnectAnytime \(r.version) is available", "Choose Update in the menu to install it.")
+            }
+            availableUpdate = r
+            buildMenu()
+        }
+    }
+
+    @objc func checkForUpdates() {
+        Task { @MainActor in
+            let release: Release
+            do { release = try await fetchLatestRelease() }
+            catch { return showAlert("Couldn't check for updates", error.localizedDescription) }
+            guard isVersion(release.version, newerThan: currentVersion) else {
+                availableUpdate = nil
+                return showAlert("You're up to date", "ConnectAnytime \(currentVersion) is the latest version.")
+            }
+            availableUpdate = release
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "ConnectAnytime \(release.version) is available"
+            alert.informativeText = "You have \(currentVersion). The app restarts to finish; the VPN stays as it is."
+            alert.addButton(withTitle: "Install and Restart")
+            alert.addButton(withTitle: "Release Notes")
+            alert.addButton(withTitle: "Later")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn: install(release)
+            case .alertSecondButtonReturn: NSWorkspace.shared.open(release.page)
+            default: break
+            }
+        }
+    }
+
+    func install(_ release: Release) {
+        guard busy == nil else { return showAlert("Try again in a moment", "Wait for the VPN to finish connecting.") }
+        guard FileManager.default.isWritableFile(atPath: Bundle.main.bundleURL.deletingLastPathComponent().path) else {
+            return showAlert("Can't update here", "Move ConnectAnytime to your Applications folder, then try again.")
+        }
+        setBusy("Updating…")
+        log("update: installing \(release.version)")
+        Task { @MainActor in
+            do {
+                try await installUpdate(release)
+                log("update: installed \(release.version), restarting")
+                relaunchAfterExit()
+                NSApp.terminate(nil)
+            } catch {
+                log("update: failed - \(error.localizedDescription)")
+                setBusy(nil)
+                showAlert("Update failed", "\(error.localizedDescription) Your current version is unchanged.")
+            }
+        }
+    }
+
+    func showAlert(_ title: String, _ text: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.runModal()
     }
 
     func notify(_ title: String, _ body: String = "") {
