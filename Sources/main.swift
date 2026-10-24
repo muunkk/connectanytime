@@ -188,6 +188,7 @@ final class ConnectSession {
     private var lineBuffer = ""
     private var answered = Set<String>()
     private var finished = false
+    private var answeredDuoNotice = false
 
     init(host: String, user: String, password: String,
          onDuo: @escaping () -> Void, onDone: @escaping (Outcome) -> Void) {
@@ -258,7 +259,16 @@ final class ConnectSession {
         // Only answer the prompt the CLI is currently waiting on (the end of its output).
         // Order matters: "Second Password:" also ends with "Password:".
         let tail = buffer.trimmingCharacters(in: .whitespaces)
-        if tail.hasSuffix("Second Password:") { onDuo(); return answer("second", "push") }
+        // Some accounts get NYU's Duo notice as the prompt, with no "Second Password:" label.
+        if buffer.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("The second password uses DUO for MFA") {
+            answeredDuoNotice = true
+            onDuo(); return answer("second", "push")
+        }
+        if tail.hasSuffix("Second Password:") {
+            // A label right after the notice is the same prompt; the "push" already sent answers it.
+            if answeredDuoNotice { answeredDuoNotice = false; buffer = ""; return }
+            onDuo(); return answer("second", "push")
+        }
         if tail.hasSuffix("Password:") { return answer("password", password) }
         if tail.range(of: "Username:( \\[[^\\]]*\\])?$", options: .regularExpression) != nil {
             return answer("username", user)
