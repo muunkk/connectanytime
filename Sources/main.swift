@@ -378,9 +378,13 @@ struct UpdateError: LocalizedError {
     init(_ message: String) { errorDescription = message }
 }
 
+/// Code-signing requirement for updates: Apple-issued Developer ID certificate of our team.
+let updateRequirement = #"anchor apple generic and identifier "local.connectanytime" and certificate leaf[subject.OU] = "GSDM59X25M""#
+
 /// Downloads and checks the release, then swaps it in for the running app.
 /// The zip must match GitHub's SHA-256 for it; the app inside must have our bundle ID, the
-/// release's version and an intact code signature. Nothing is replaced unless all pass.
+/// release's version and an intact code signature from our Developer ID. Nothing is replaced
+/// unless all pass.
 func installUpdate(_ release: Release) async throws {
     let (download, _) = try await URLSession.shared.download(from: release.zip)
     defer { try? FileManager.default.removeItem(at: download) }
@@ -396,7 +400,7 @@ func installUpdate(_ release: Release) async throws {
           info["CFBundleIdentifier"] as? String == Bundle.main.bundleIdentifier,
           let version = info["CFBundleShortVersionString"] as? String,
           !isVersion(version, newerThan: release.version), !isVersion(release.version, newerThan: version),
-          succeeds("/usr/bin/codesign", ["--verify", "--deep", "--strict", newApp.path])
+          succeeds("/usr/bin/codesign", ["--verify", "--deep", "--strict", "-R=\(updateRequirement)", newApp.path])
     else { throw UpdateError("The update didn't pass its checks.") }
 
     _ = try FileManager.default.replaceItemAt(Bundle.main.bundleURL, withItemAt: newApp)

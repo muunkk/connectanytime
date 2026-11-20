@@ -44,12 +44,11 @@ can't lock your account.
 
 Requires macOS 13+ (Apple Silicon or Intel) and Cisco Secure Client.
 
-1. Download `ConnectAnytime.zip` from the
-   [latest release](https://github.com/muunkk/connectanytime/releases/latest) and unzip it.
-2. Move `ConnectAnytime.app` to your Applications folder.
-3. Open it. The app isn't notarized by Apple, so macOS blocks it the first time. Go to
-   **System Settings ▸ Privacy & Security**, scroll down and click **Open Anyway**.
-   (Or run `xattr -dr com.apple.quarantine /Applications/ConnectAnytime.app` in Terminal.)
+1. Download `ConnectAnytime.dmg` from the
+   [latest release](https://github.com/muunkk/connectanytime/releases/latest) and open it.
+2. Drag `ConnectAnytime` onto the Applications folder next to it.
+3. Open it from Applications. It's signed and notarized by Apple, so it opens without a
+   security warning.
 4. Click the globe in the menu bar, then **Connect**. It asks for your NYU password once.
 
 Optional: turn on **Launch at Login** in the menu.
@@ -59,10 +58,10 @@ Optional: turn on **Launch at Login** in the menu.
 The app checks GitHub for a new release once a day and shows **Update to x.y.z…** in the
 menu when there is one (or choose **Check for Updates…**). Installing downloads the
 release's `ConnectAnytime.zip`, checks it against the SHA-256 GitHub publishes for it, checks
-the app inside is intact (bundle ID, version, code signature), then swaps it in and restarts.
-Like a manual download, this trusts this GitHub repository. The VPN
-connection isn't touched. After an update macOS may ask whether the app can use its Keychain
-item: choose **Always Allow**.
+the app inside is intact (bundle ID, version, and a code signature from this project's
+Developer ID), then swaps it in and restarts. The VPN connection isn't touched. Updating from
+0.1.x to 0.2.0 or later, macOS asks once whether the app can use its Keychain item: choose
+**Always Allow**. Later updates don't ask.
 
 ## Build from source
 
@@ -70,11 +69,14 @@ Requires Xcode command-line tools.
 
 ```sh
 ./build.sh             # build and install to ~/Applications
-./build.sh --release   # build build/ConnectAnytime.zip
+./build.sh --release   # build signed, notarized build/ConnectAnytime.dmg and .zip
 ```
 
-The build is ad-hoc signed. After each rebuild macOS may ask whether the app can use its
-Keychain item: choose **Always Allow**.
+Builds are signed with the Developer ID certificate in your keychain if there is one, ad-hoc
+otherwise (macOS may then ask about the Keychain item after each rebuild: choose
+**Always Allow**). `--release` needs the Developer ID certificate and notarization
+credentials; the top of `build.sh` shows the one-time setup. Publish both files on the
+GitHub release: the `.dmg` is the download, the `.zip` is what the in-app updater installs.
 
 Log: `~/Library/Logs/ConnectAnytime.log`. It records which prompts were answered and
 Cisco's status lines, never what was typed.
