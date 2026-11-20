@@ -441,6 +441,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var availableUpdate: Release?
     /// The release being installed. Kept apart from `busy`, which is only about the VPN.
     var updating: Release?
+    /// Bumped by each state check and each busy change, so a check that started earlier
+    /// can't overwrite newer state when it finishes.
+    var refreshGeneration = 0
 
     var isConnected: Bool { state == "Connected" }
     /// Connected or on the way there, including Cisco's own reconnects after a network change.
@@ -497,10 +500,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func refresh() {
         guard busy == nil else { return }
+        refreshGeneration += 1
+        let generation = refreshGeneration
         DispatchQueue.global().async {
             let s = parseState(runVPN(["state"])) ?? "Unknown"
             DispatchQueue.main.async {
-                guard self.busy == nil else { return }
+                // Unchanged state: leave the menu alone, it may be open.
+                guard self.busy == nil, generation == self.refreshGeneration, s != self.state else { return }
                 self.state = s
                 self.render()
             }
@@ -558,6 +564,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func setBusy(_ text: String?) {
         busy = text
+        refreshGeneration += 1 // drop any state check started before this
         render()
     }
 
@@ -596,6 +603,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 } },
                 onDone: { outcome in
                     self.session = nil
+                    if case .connected = outcome { self.state = "Connected" } // don't flash the old state
                     self.setBusy(nil)
                     if case .failed(let why) = outcome { self.notify("VPN connect failed", why) }
                     self.refresh()
@@ -611,8 +619,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setBusy("VPN: Disconnecting…")
         log("app: disconnect requested")
         DispatchQueue.global().async {
-            runVPN(["disconnect"])
-            DispatchQueue.main.async { self.setBusy(nil); self.refresh() }
+            let s = parseState(runVPN(["disconnect"]))
+            DispatchQueue.main.async {
+                if s == "Disconnected" { self.state = "Disconnected" } // don't flash "Connected" until the next check
+                self.setBusy(nil)
+                self.refresh()
+            }
         }
     }
 
@@ -801,7 +813,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func install(_ release: Release) {
         guard updating == nil else { return }
-        guard busy == nil else { return showAlert("Try again in a moment", "Wait for the VPN to finish connecting.") }
+        guard busy == nil else { return showAlert("Try again in a moment", "Wait for the VPN to finish connecting or disconnecting.") }
         guard FileManager.default.isWritableFile(atPath: Bundle.main.bundleURL.deletingLastPathComponent().path) else {
             return showAlert("Can't update here", "Move ConnectAnytime to your Applications folder, then try again.")
         }
