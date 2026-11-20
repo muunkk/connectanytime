@@ -122,18 +122,21 @@ func run(_ path: String, _ args: [String], timeout: TimeInterval? = 30) -> Strin
     p.standardOutput = pipe
     p.standardError = pipe
     p.standardInput = FileHandle.nullDevice
-    // Read until EOF in the background, so the deadline holds even when a process the
-    // command started keeps the pipe open after the command itself is killed.
+    // Read until EOF in the background, and give output and exit one shared deadline, so it
+    // holds whether the command hangs, closes its output and then hangs, or leaves a process
+    // behind that keeps the pipe open.
     var data = Data()
-    let lock = NSLock(), eof = DispatchSemaphore(value: 0)
+    let lock = NSLock(), eof = DispatchSemaphore(value: 0), exited = DispatchSemaphore(value: 0)
     let reader = pipe.fileHandleForReading
     reader.readabilityHandler = { h in
         let chunk = h.availableData
         if chunk.isEmpty { h.readabilityHandler = nil; eof.signal() }
         else { lock.lock(); data.append(chunk); lock.unlock() }
     }
+    p.terminationHandler = { _ in exited.signal() }
     guard (try? p.run()) != nil else { reader.readabilityHandler = nil; return "" }
-    if eof.wait(timeout: timeout.map { .now() + $0 } ?? .distantFuture) == .timedOut {
+    let deadline: DispatchTime = timeout.map { .now() + $0 } ?? .distantFuture
+    if eof.wait(timeout: deadline) == .timedOut || exited.wait(timeout: deadline) == .timedOut {
         log("run: \(path) timed out")
         reader.readabilityHandler = nil
         p.terminate() // Foundation signals only its own, still-unreaped child
@@ -201,6 +204,7 @@ final class ConnectSession {
 
     private let host: String, user: String, password: String
     private let onDuo: () -> Void
+    private let onStopping: () -> Void
     private let onDone: (Outcome) -> Void
     private let queue = DispatchQueue(label: "connectanytime.session")
     private let process = Process()
@@ -213,9 +217,9 @@ final class ConnectSession {
     private var answeredDuoNotice = false
 
     init(host: String, user: String, password: String,
-         onDuo: @escaping () -> Void, onDone: @escaping (Outcome) -> Void) {
+         onDuo: @escaping () -> Void, onStopping: @escaping () -> Void, onDone: @escaping (Outcome) -> Void) {
         self.host = host; self.user = user; self.password = password
-        self.onDuo = onDuo; self.onDone = onDone
+        self.onDuo = onDuo; self.onStopping = onStopping; self.onDone = onDone
     }
 
     func start() {
@@ -332,6 +336,7 @@ final class ConnectSession {
     private func finish(_ outcome: Outcome) {
         guard !finished else { return }
         finished = true
+        DispatchQueue.main.async { self.onStopping() } // Cancel does nothing from here on
         switch outcome {
         case .connected: log("session: connected")
         case .failed(let why): log("session: failed after \(answered.sorted()) - \(why)")
@@ -471,11 +476,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var operationEpoch = 0
     /// State checks are numbered so an older one finishing late can't undo a newer one.
     var lastCheckStarted = 0, lastCheckApplied = 0
-    /// Router of a saved network that was joined and hasn't had its one connect attempt yet.
-    /// Waits while the VPN state is unknown; any connect, disconnect or command uses it up.
-    var pendingJoin: String?
-    /// A network change is being identified; nothing auto-connects until it is.
-    var identifyingNetwork = false
+    /// A connect or disconnect started since the last network change. It counts as that
+    /// network's one attempt, so auto-connect doesn't follow it.
+    var actedSinceNetworkChange = false
 
     var isConnected: Bool { state == "Connected" }
     /// Connected or on the way there, including Cisco's own reconnects after a network change.
@@ -490,13 +493,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        // Restarted by an update: same network, so it isn't a fresh join to auto-connect on,
-        // but a join that was still waiting for its attempt carries over.
-        let d = UserDefaults.standard
-        currentRouter = d.string(forKey: "routerBeforeUpdate")
-        pendingJoin = d.string(forKey: "pendingJoinBeforeUpdate")
-        d.removeObject(forKey: "routerBeforeUpdate")
-        d.removeObject(forKey: "pendingJoinBeforeUpdate")
+        // Restarted by an update: the network it was on isn't a fresh join to auto-connect on.
+        currentRouter = UserDefaults.standard.string(forKey: "routerBeforeUpdate")
+        UserDefaults.standard.removeObject(forKey: "routerBeforeUpdate")
         menu.delegate = self
         item.menu = menu
         render()
@@ -521,19 +520,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DistributedNotificationCenter.default().addObserver(forName: commandNotification, object: nil, queue: .main) { [weak self] n in
             guard let self, let cmd = n.object as? String else { return }
             log("app: command \(cmd)")
-            pendingJoin = nil // an explicit command wins over a waiting auto-connect
-            // Decide from Cisco's current state, not the last poll.
-            checkState { s in
-                guard let s else { return log("app: command \(cmd) ignored, the VPN is busy") }
-                switch cmd {
-                case "connect": self.connect()
-                case "disconnect": self.disconnect()
-                case "toggle" where s == "Unknown":
-                    self.notify("Couldn't read the VPN state", "Choose Connect or Disconnect in the menu.")
-                case "toggle": self.isActive ? self.disconnect() : self.connect()
-                default: break
-                }
-            }
+            run(command: cmd, tries: 2)
         }
     }
 
@@ -542,18 +529,33 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMenu()
     }
 
-    // MARK: State
-
-    func refresh() {
+    /// Runs a command on Cisco's current state, not the last poll. A check overtaken by a
+    /// newer one is retried; one overtaken by a connect or disconnect drops the command.
+    func run(command cmd: String, tries: Int) {
         checkState { s in
-            // Only the newest check may start an auto-connect; a newer one may say it's on.
-            if s != nil, self.lastCheckApplied == self.lastCheckStarted { self.autoConnectIfPending() }
+            guard let s else {
+                if self.busy == nil, tries > 1 { return self.run(command: cmd, tries: tries - 1) }
+                return log("app: command \(cmd) dropped, the VPN state changed")
+            }
+            switch cmd {
+            case "connect": self.connect()
+            case "disconnect": self.disconnect()
+            case "toggle" where s == "Unknown":
+                self.notify("Couldn't read the VPN state", "Choose Connect or Disconnect in the menu.")
+            case "toggle": self.isActive ? self.disconnect() : self.connect()
+            default: break
+            }
         }
     }
 
+    // MARK: State
+
+    func refresh() { checkState { _ in } }
+
     /// Checks Cisco's state off the main thread, applies it, and calls `done` on the main
-    /// thread with it, or with nil if a VPN operation started or ended in the meantime (or one
-    /// is running), since the result may then be out of date.
+    /// thread with it. Calls `done` with nil instead if the result is out of date: a VPN
+    /// operation is running or started or ended meanwhile, or a newer check got in first.
+    /// A non-nil result is always `state`.
     func checkState(_ done: @escaping (String?) -> Void) {
         guard busy == nil else { return done(nil) }
         lastCheckStarted += 1
@@ -562,10 +564,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let s = currentVPNState()
             DispatchQueue.main.async {
                 guard self.busy == nil, epoch == self.operationEpoch else { return done(nil) }
-                if check > self.lastCheckApplied { // an older check finishing late can't undo a newer one
-                    self.lastCheckApplied = check
-                    if s != self.state { self.state = s; self.render() } // unchanged: leave the open menu alone
-                }
+                // An older check finishing late can't undo a newer one.
+                guard check > self.lastCheckApplied else { return done(nil) }
+                self.lastCheckApplied = check
+                if s != self.state { self.state = s; self.render() } // unchanged: leave the open menu alone
                 done(s)
             }
         }
@@ -651,7 +653,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if promptForPassword() { connect() }
             return
         }
-        pendingJoin = nil // any attempt, manual or not, is the join's one try
+        actedSinceNetworkChange = true // any attempt, manual or not, is the join's one try
         setBusy("VPN: Connecting…")
         log("app: connect requested")
         DispatchQueue.global().async {
@@ -673,9 +675,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.setBusy("VPN: Approve Duo on your phone…")
                     self.notify("Approve Duo on your phone")
                 } },
-                onDone: { outcome in // on the main thread
-                    self.session = nil // finished: Cancel would do nothing now
+                onStopping: { // main thread; the attempt may still be cleaning up
+                    self.session = nil
                     self.setBusy("VPN: Checking…")
+                },
+                onDone: { outcome in // main thread
                     var known: String?
                     switch outcome {
                     case .connected: known = "Connected"
@@ -691,7 +695,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func disconnect() {
         guard busy == nil, updating == nil else { return }
-        pendingJoin = nil // a manual disconnect isn't undone by a join in progress
+        actedSinceNetworkChange = true // a manual disconnect isn't undone by an auto-connect
         setBusy("VPN: Disconnecting…")
         log("app: disconnect requested")
         DispatchQueue.global().async {
@@ -743,8 +747,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func networkChanged(_ iface: String?) {
         networkCheck?.cancel()
         networkGeneration += 1
-        guard let iface else { currentRouter = nil; pendingJoin = nil; identifyingNetwork = false; return }
-        identifyingNetwork = true
+        actedSinceNetworkChange = busy != nil // an operation already running is this network's try
+        guard let iface else { currentRouter = nil; return }
         let generation = networkGeneration
         let work = DispatchWorkItem { [weak self] in self?.identifyNetwork(iface, generation: generation) }
         networkCheck = work
@@ -761,36 +765,31 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             DispatchQueue.main.async {
                 guard generation == self.networkGeneration else { return } // the network changed again
-                self.identifyingNetwork = false
-                // Unidentified: can't tell it's still the joined network, so drop that join.
-                guard let router else { self.pendingJoin = nil; return }
                 // Same router means same network (e.g. the VPN itself changed the path).
-                guard router != self.currentRouter else { return self.autoConnectIfPending() }
+                guard let router, router != self.currentRouter else { return }
                 self.currentRouter = router
-                self.pendingJoin = nil
                 self.render() // the checkmark in Auto-Connect Networks
                 guard let net = self.savedNetworks.first(where: { $0.router == router }) else { return }
-                // Joined during a manual connect or disconnect: that operation is the join's try.
-                guard self.busy == nil else { return log("auto: joined \"\(net.name)\" during a VPN operation") }
                 log("auto: joined saved network \"\(net.name)\"")
-                self.pendingJoin = router
-                self.autoConnectIfPending()
+                self.autoConnect(router: router, generation: generation)
             }
         }
     }
 
-    /// The one connect attempt for a saved-network join, once the VPN is known to be off.
-    func autoConnectIfPending() {
-        guard let join = pendingJoin, busy == nil, updating == nil, !identifyingNetwork else { return }
-        guard join == currentRouter, savedNetworks.contains(where: { $0.router == join }) else {
-            pendingJoin = nil // left that network, or it was removed from the list
-            return
+    /// The one connect attempt for joining a saved network, made only if a fresh state check
+    /// says the VPN is off and nothing else happened since the join: no connect or disconnect,
+    /// no other network change, no update. Otherwise the join is dropped, never kept for later.
+    func autoConnect(router: String, generation: Int) {
+        let skip = { (why: String) in log("auto: not connecting, \(why)") }
+        guard !actedSinceNetworkChange else { return skip("a connect or disconnect already ran") }
+        guard updating == nil else { return skip("an update is installing") }
+        checkState { s in
+            guard generation == self.networkGeneration, router == self.currentRouter else { return skip("the network changed") }
+            guard !self.actedSinceNetworkChange, self.updating == nil, let s else { return skip("something else happened first") }
+            guard s == "Disconnected" else { return skip("the VPN is \(s)") }
+            guard Keychain.read(account: self.prefs.user) != nil else { return skip("no saved password") } // never prompt unasked
+            self.connect()
         }
-        if isActive { pendingJoin = nil; return } // already on
-        guard state == "Disconnected" else { return } // "Unknown": wait for a real answer
-        pendingJoin = nil
-        guard Keychain.read(account: prefs.user) != nil else { return } // never prompt unasked
-        connect()
     }
 
     func autoConnectMenu() -> NSMenuItem {
@@ -942,15 +941,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             do {
                 try await installUpdate(release)
                 log("update: installed \(release.version), restarting")
-                UserDefaults.standard.set(identifyingNetwork ? nil : currentRouter, forKey: "routerBeforeUpdate")
-                UserDefaults.standard.set(pendingJoin, forKey: "pendingJoinBeforeUpdate")
+                UserDefaults.standard.set(currentRouter, forKey: "routerBeforeUpdate") // the last one identified
                 relaunchAfterExit()
                 NSApp.terminate(nil)
             } catch {
                 log("update: failed - \(error.localizedDescription)")
                 updating = nil
                 buildMenu()
-                autoConnectIfPending() // a join that happened during the update
                 let intact = FileManager.default.fileExists(atPath: Bundle.main.bundlePath)
                 showAlert("Update failed", intact
                     ? "\(error.localizedDescription) Your current version is unchanged."
