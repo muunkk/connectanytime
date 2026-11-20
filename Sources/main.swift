@@ -439,6 +439,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var networkCheck: DispatchWorkItem?
     var currentRouter: String?
     var availableUpdate: Release?
+    /// The release being installed. Kept apart from `busy`, which is only about the VPN.
+    var updating: Release?
 
     var isConnected: Bool { state == "Connected" }
     /// Connected or on the way there, including Cisco's own reconnects after a network change.
@@ -512,19 +514,25 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         else { symbol = "network.badge.shield.half.filled" } // connecting, Duo, reconnecting, disconnecting
         item.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "VPN")?
             .withSymbolConfiguration(.init(pointSize: 15, weight: .regular))
-        item.button?.toolTip = "NYU VPN: \(busy ?? state)"
+        item.button?.toolTip = statusTitle
         buildMenu()
     }
 
+    /// The menu's first line: always the VPN, never the app's own update.
+    var statusTitle: String { busy ?? "VPN: \(state)" }
+
     func buildMenu() {
         menu.removeAllItems()
-        menu.addItem(withTitle: busy ?? state, action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: statusTitle, action: nil, keyEquivalent: "")
         menu.addItem(.separator())
-        if busy == nil {
-            if isActive { add("Disconnect", #selector(disconnect)) }
-            else { add("Connect", #selector(connect)) }
-        } else if session != nil {
+        // Always one action row; it's greyed out (no action) while it can't be used.
+        if session != nil {
             add("Cancel", #selector(cancelConnect))
+        } else if isActive {
+            add("Disconnect", busy == nil ? #selector(disconnect) : nil)
+        } else {
+            // A connect would be cut off by the restart that finishes an update.
+            add("Connect", busy == nil && updating == nil ? #selector(connect) : nil)
         }
         menu.addItem(.separator())
         menu.addItem(autoConnectMenu())
@@ -532,13 +540,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("Open Cisco Secure Client", #selector(openCisco))
         let login = add("Launch at Login", #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        add(availableUpdate.map { "Update to \($0.version)…" } ?? "Check for Updates…", #selector(checkForUpdates))
+        if let updating {
+            add("Updating to \(updating.version)…", nil)
+        } else {
+            add(availableUpdate.map { "Update to \($0.version)…" } ?? "Check for Updates…", #selector(checkForUpdates))
+        }
         menu.addItem(.separator())
         add("Quit", #selector(NSApplication.terminate(_:)), target: NSApp)
     }
 
     @discardableResult
-    func add(_ title: String, _ action: Selector, target: AnyObject? = nil) -> NSMenuItem {
+    func add(_ title: String, _ action: Selector?, target: AnyObject? = nil) -> NSMenuItem {
         let i = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
         i.target = target ?? self
         return i
@@ -552,7 +564,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Actions
 
     @objc func connect() {
-        guard busy == nil, !isActive else { return }
+        guard busy == nil, updating == nil, !isActive else { return }
         guard !prefs.user.isEmpty else {
             notify("No Cisco username found", "Connect once with Cisco Secure Client so it remembers your username.")
             return
@@ -561,7 +573,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if promptForPassword() { connect() }
             return
         }
-        setBusy("Connecting…")
+        setBusy("VPN: Connecting…")
         log("app: connect requested")
         DispatchQueue.global().async {
             if let dest = staleServerRoute(self.prefs.host) {
@@ -596,7 +608,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func disconnect() {
         guard busy == nil else { return }
-        setBusy("Disconnecting…")
+        setBusy("VPN: Disconnecting…")
         log("app: disconnect requested")
         DispatchQueue.global().async {
             runVPN(["disconnect"])
@@ -788,11 +800,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func install(_ release: Release) {
+        guard updating == nil else { return }
         guard busy == nil else { return showAlert("Try again in a moment", "Wait for the VPN to finish connecting.") }
         guard FileManager.default.isWritableFile(atPath: Bundle.main.bundleURL.deletingLastPathComponent().path) else {
             return showAlert("Can't update here", "Move ConnectAnytime to your Applications folder, then try again.")
         }
-        setBusy("Updating…")
+        updating = release
+        buildMenu()
         log("update: installing \(release.version)")
         Task { @MainActor in
             do {
@@ -802,7 +816,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSApp.terminate(nil)
             } catch {
                 log("update: failed - \(error.localizedDescription)")
-                setBusy(nil)
+                updating = nil
+                buildMenu()
                 showAlert("Update failed", "\(error.localizedDescription) Your current version is unchanged.")
             }
         }
