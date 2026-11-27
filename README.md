@@ -56,12 +56,13 @@ Optional: turn on **Launch at Login** in the menu.
 ## Updates
 
 The app checks GitHub for a new release once a day and shows **Update to x.y.z…** in the
-menu when there is one (or choose **Check for Updates…**). Installing downloads the
-release's `ConnectAnytime.zip`, checks it against the SHA-256 GitHub publishes for it, checks
-the app inside is intact (bundle ID, version, and a code signature from this project's
-Developer ID), then swaps it in and restarts. The VPN connection isn't touched. Updating from
-0.1.x to 0.2.0 or later, macOS asks once whether the app can use its Keychain item: choose
-**Always Allow**. Later updates don't ask.
+menu when there is one (or choose **Check for Updates…**). The update dialog shows that
+release's notes before you install it. Installing downloads the release's
+`ConnectAnytime.zip`, checks it against the SHA-256 GitHub publishes for it, checks the app
+inside is intact (bundle ID, version, and a code signature from this project's Developer ID),
+then swaps it in and restarts. The VPN connection isn't touched. Updating from 0.1.x to 0.2.0
+or later, macOS asks once whether the app can use its Keychain item: choose **Always Allow**.
+Later updates don't ask.
 
 ## Build from source
 

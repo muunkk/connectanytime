@@ -369,13 +369,13 @@ struct Release {
     var version: String
     var zip: URL
     var sha256: String // published by GitHub for the asset
-    var page: URL
+    var notes: String // Markdown body from the GitHub release
 }
 
 private struct GitHubRelease: Decodable {
     struct Asset: Decodable { let name: String; let browser_download_url: URL; let digest: String? }
     let tag_name: String
-    let html_url: URL
+    let body: String?
     let assets: [Asset]
 }
 
@@ -400,7 +400,8 @@ func fetchLatestRelease() async throws -> Release {
           asset.browser_download_url.absoluteString.hasPrefix(releaseDownloadPrefix),
           let digest = asset.digest, digest.range(of: "^sha256:[0-9a-f]{64}$", options: .regularExpression) != nil
     else { throw UpdateError("The latest release doesn't have a verifiable ConnectAnytime.zip.") }
-    return Release(version: version, zip: asset.browser_download_url, sha256: String(digest.dropFirst(7)), page: r.html_url)
+    return Release(version: version, zip: asset.browser_download_url, sha256: String(digest.dropFirst(7)),
+                   notes: r.body?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
 }
 
 struct UpdateError: LocalizedError {
@@ -454,6 +455,90 @@ func succeeds(_ path: String, _ args: [String]) -> Bool {
     guard (try? p.run()) != nil else { return false }
     p.waitUntilExit()
     return p.terminationStatus == 0
+}
+
+/// A small native release-notes panel for the update alert. GitHub's common headings,
+/// bullets and inline Markdown are made readable without embedding a web view.
+func releaseNotesView(_ markdown: String) -> NSView? {
+    guard !markdown.isEmpty else { return nil }
+
+    let width: CGFloat = 440, notesHeight: CGFloat = 170, headingHeight: CGFloat = 20
+    let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: headingHeight + 8 + notesHeight))
+    let heading = NSTextField(labelWithString: "What’s New")
+    heading.font = .boldSystemFont(ofSize: NSFont.systemFontSize)
+    heading.frame = NSRect(x: 0, y: notesHeight + 8, width: width, height: headingHeight)
+
+    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: notesHeight))
+    scroll.borderType = .bezelBorder
+    scroll.hasVerticalScroller = true
+    scroll.autohidesScrollers = true
+
+    let text = NSTextView(frame: NSRect(origin: .zero, size: scroll.contentSize))
+    text.isEditable = false
+    text.isSelectable = true
+    text.drawsBackground = false
+    text.textContainerInset = NSSize(width: 8, height: 8)
+    text.isHorizontallyResizable = false
+    text.isVerticallyResizable = true
+    text.autoresizingMask = [.width]
+    text.textContainer?.widthTracksTextView = true
+    text.textContainer?.containerSize = NSSize(width: scroll.contentSize.width, height: .greatestFiniteMagnitude)
+    text.linkTextAttributes = [.foregroundColor: NSColor.linkColor, .underlineStyle: NSUnderlineStyle.single.rawValue]
+    text.textStorage?.setAttributedString(formatReleaseNotes(markdown))
+    scroll.documentView = text
+
+    container.addSubview(heading)
+    container.addSubview(scroll)
+    return container
+}
+
+func formatReleaseNotes(_ markdown: String) -> NSAttributedString {
+    let result = NSMutableAttributedString()
+    let body = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+    let heading = NSFont.boldSystemFont(ofSize: NSFont.systemFontSize + 1)
+
+    func append(_ source: String, font: NSFont) {
+        let parsed = try? AttributedString(markdown: source,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))
+        let text = parsed.map(NSAttributedString.init) ?? NSAttributedString(string: source)
+        let styled = NSMutableAttributedString(attributedString: text)
+        let all = NSRange(location: 0, length: styled.length)
+        styled.addAttributes([.font: font, .foregroundColor: NSColor.labelColor], range: all)
+        // The parser marks **bold**, *italic*, `code` and ~~struck~~ spans but sets no fonts.
+        styled.enumerateAttribute(.inlinePresentationIntent, in: all) { value, range, _ in
+            guard let raw = (value as? NSNumber)?.uintValue else { return }
+            let intent = InlinePresentationIntent(rawValue: raw)
+            var traits: NSFontDescriptor.SymbolicTraits = []
+            if intent.contains(.stronglyEmphasized) { traits.insert(.bold) }
+            if intent.contains(.emphasized) { traits.insert(.italic) }
+            let base = intent.contains(.code) ? NSFont.monospacedSystemFont(ofSize: font.pointSize, weight: .regular) : font
+            let descriptor = base.fontDescriptor.withSymbolicTraits(base.fontDescriptor.symbolicTraits.union(traits))
+            styled.addAttribute(.font, value: NSFont(descriptor: descriptor, size: base.pointSize) ?? base, range: range)
+            if intent.contains(.strikethrough) {
+                styled.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+            }
+        }
+        result.append(styled)
+    }
+
+    let lines = markdown.split(separator: "\n", omittingEmptySubsequences: false)
+    for (index, raw) in lines.enumerated() {
+        let line = String(raw)
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        let headingMarks = trimmed.prefix(while: { $0 == "#" })
+        let afterHeading = trimmed.dropFirst(headingMarks.count)
+        if (1...6).contains(headingMarks.count), afterHeading.first?.isWhitespace == true {
+            append(afterHeading.drop(while: { $0.isWhitespace }).description, font: heading)
+        } else if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
+            append("• " + String(trimmed.dropFirst(2)), font: body)
+        } else {
+            append(line, font: body)
+        }
+        if index < lines.count - 1 {
+            result.append(NSAttributedString(string: "\n", attributes: [.font: body]))
+        }
+    }
+    return result
 }
 
 // MARK: - App
@@ -943,12 +1028,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let alert = NSAlert()
             alert.messageText = "ConnectAnytime \(release.version) is available"
             alert.informativeText = "You have \(currentVersion). The app restarts to finish; the VPN stays as it is."
+            alert.accessoryView = releaseNotesView(release.notes)
             alert.addButton(withTitle: "Install and Restart")
-            alert.addButton(withTitle: "Release Notes")
             alert.addButton(withTitle: "Later")
             switch alert.runModal() {
             case .alertFirstButtonReturn: install(release)
-            case .alertSecondButtonReturn: NSWorkspace.shared.open(release.page)
             default: break
             }
         }
