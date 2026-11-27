@@ -654,7 +654,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if promptForPassword() { connect() }
             return
         }
-        actedSinceNetworkChange = true // any attempt, manual or not, is the join's one try
+        actedSinceNetworkChange = true; pendingJoin = nil // any attempt, manual or not, is the join's one try
         setBusy("VPN: Connecting…")
         log("app: connect requested")
         DispatchQueue.global().async {
@@ -696,7 +696,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func disconnect() {
         guard busy == nil, updating == nil else { return }
-        actedSinceNetworkChange = true // a manual disconnect isn't undone by an auto-connect
+        actedSinceNetworkChange = true; pendingJoin = nil // a manual disconnect isn't undone by an auto-connect
         setBusy("VPN: Disconnecting…")
         log("app: disconnect requested")
         DispatchQueue.global().async {
@@ -744,12 +744,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Bumped on every network change, so a lookup for a network you've since left is dropped.
     var networkGeneration = 0
+    /// A saved network whose auto-connect check a path update cut short. The next lookup
+    /// tries again if it finds the same router, since the update may have been a move elsewhere.
+    var pendingJoin: String?
 
     func networkChanged(_ iface: String?) {
         networkCheck?.cancel()
         networkGeneration += 1
         actedSinceNetworkChange = busy != nil // an operation already running is this network's try
-        guard let iface else { currentRouter = nil; return }
+        guard let iface else { currentRouter = nil; pendingJoin = nil; return }
         let generation = networkGeneration
         let work = DispatchWorkItem { [weak self] in self?.identifyNetwork(iface, generation: generation) }
         networkCheck = work
@@ -766,13 +769,19 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             DispatchQueue.main.async {
                 guard generation == self.networkGeneration else { return } // the network changed again
+                let pending = self.pendingJoin
+                self.pendingJoin = nil
+                guard let router else { return }
                 // Same router means same network (e.g. the VPN itself changed the path).
-                guard let router, router != self.currentRouter else { return }
+                guard router != self.currentRouter else {
+                    if pending == router { self.autoConnect(router: router, generation: generation) }
+                    return
+                }
                 self.currentRouter = router
                 self.render() // the checkmark in Auto-Connect Networks
                 guard let net = self.savedNetworks.first(where: { $0.router == router }) else { return }
                 log("auto: joined saved network \"\(net.name)\"")
-                self.autoConnect(router: router)
+                self.autoConnect(router: router, generation: generation)
             }
         }
     }
@@ -780,16 +789,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The one connect attempt for joining a saved network, made only if a fresh state check
     /// says the VPN is off and nothing else happened since the join: no connect or disconnect,
     /// no move to another network, no update, the network still saved. Otherwise the join is
-    /// dropped, never kept for later.
-    func autoConnect(router: String) {
+    /// dropped, except that a path update waits for the next lookup to confirm the network.
+    func autoConnect(router: String, generation: Int) {
         let skip = { (why: String) in log("auto: not connecting, \(why)") }
         guard !actedSinceNetworkChange else { return skip("a connect or disconnect already ran") }
         guard updating == nil else { return skip("an update is installing") }
         checkState { s in
-            // Not the generation: path updates on the same network (DNS, IPv6, the VPN) bump it.
             guard router == self.currentRouter else { return skip("the network changed") }
             guard self.savedNetworks.contains(where: { $0.router == router }) else { return skip("the network was removed") }
             guard !self.actedSinceNetworkChange, self.updating == nil, let s else { return skip("something else happened first") }
+            // A path update: same network (DNS, IPv6, the VPN) or a move whose router isn't known yet.
+            guard generation == self.networkGeneration else {
+                self.pendingJoin = router
+                return log("auto: the network path changed, waiting for the next lookup")
+            }
             guard s == "Disconnected" else { return skip("the VPN is \(s)") }
             guard Keychain.read(account: self.prefs.user) != nil else { return skip("no saved password") } // never prompt unasked
             self.connect()
