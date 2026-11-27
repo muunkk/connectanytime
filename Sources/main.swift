@@ -747,6 +747,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// A saved network whose auto-connect check a path update cut short. The next lookup
     /// tries again if it finds the same router, since the update may have been a move elsewhere.
     var pendingJoin: String?
+    /// The latest network generations whose lookup finished, and whose lookup found a router
+    /// (now `currentRouter`).
+    var lookedUpGeneration = -1, confirmedGeneration = -1
 
     func networkChanged(_ iface: String?) {
         networkCheck?.cancel()
@@ -771,7 +774,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard generation == self.networkGeneration else { return } // the network changed again
                 let pending = self.pendingJoin
                 self.pendingJoin = nil
+                self.lookedUpGeneration = generation
                 guard let router else { return }
+                self.confirmedGeneration = generation
                 // Same router means same network (e.g. the VPN itself changed the path).
                 guard router != self.currentRouter else {
                     if pending == router { self.autoConnect(router: router, generation: generation) }
@@ -798,12 +803,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard router == self.currentRouter else { return skip("the network changed") }
             guard self.savedNetworks.contains(where: { $0.router == router }) else { return skip("the network was removed") }
             guard !self.actedSinceNetworkChange, self.updating == nil, let s else { return skip("something else happened first") }
-            // A path update: same network (DNS, IPv6, the VPN) or a move whose router isn't known yet.
-            guard generation == self.networkGeneration else {
-                self.pendingJoin = router
-                return log("auto: the network path changed, waiting for the next lookup")
-            }
             guard s == "Disconnected" else { return skip("the VPN is \(s)") }
+            // A path update: same network (DNS, IPv6, the VPN) or a move. Go ahead only once the
+            // lookup for the latest change finds this router; if it hasn't run, it decides.
+            if generation != self.networkGeneration {
+                guard self.lookedUpGeneration == self.networkGeneration else {
+                    self.pendingJoin = router
+                    return log("auto: the network path changed, waiting for the next lookup")
+                }
+                guard self.confirmedGeneration == self.networkGeneration else { return skip("the network wasn't identified") }
+            }
             guard Keychain.read(account: self.prefs.user) != nil else { return skip("no saved password") } // never prompt unasked
             self.connect()
         }
