@@ -502,8 +502,22 @@ func formatReleaseNotes(_ markdown: String) -> NSAttributedString {
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))
         let text = parsed.map(NSAttributedString.init) ?? NSAttributedString(string: source)
         let styled = NSMutableAttributedString(attributedString: text)
-        styled.addAttributes([.font: font, .foregroundColor: NSColor.labelColor],
-                             range: NSRange(location: 0, length: styled.length))
+        let all = NSRange(location: 0, length: styled.length)
+        styled.addAttributes([.font: font, .foregroundColor: NSColor.labelColor], range: all)
+        // The parser marks **bold**, *italic*, `code` and ~~struck~~ spans but sets no fonts.
+        styled.enumerateAttribute(.inlinePresentationIntent, in: all) { value, range, _ in
+            guard let raw = (value as? NSNumber)?.uintValue else { return }
+            let intent = InlinePresentationIntent(rawValue: raw)
+            var traits: NSFontDescriptor.SymbolicTraits = []
+            if intent.contains(.stronglyEmphasized) { traits.insert(.bold) }
+            if intent.contains(.emphasized) { traits.insert(.italic) }
+            let base = intent.contains(.code) ? NSFont.monospacedSystemFont(ofSize: font.pointSize, weight: .regular) : font
+            let descriptor = base.fontDescriptor.withSymbolicTraits(base.fontDescriptor.symbolicTraits.union(traits))
+            styled.addAttribute(.font, value: NSFont(descriptor: descriptor, size: base.pointSize) ?? base, range: range)
+            if intent.contains(.strikethrough) {
+                styled.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+            }
+        }
         result.append(styled)
     }
 
