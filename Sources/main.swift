@@ -136,7 +136,9 @@ func run(_ path: String, _ args: [String], timeout: TimeInterval? = 30) -> Strin
     p.terminationHandler = { _ in exited.signal() }
     guard (try? p.run()) != nil else { reader.readabilityHandler = nil; return "" }
     let deadline: DispatchTime = timeout.map { .now() + $0 } ?? .distantFuture
+    var timedOut = false
     if eof.wait(timeout: deadline) == .timedOut || exited.wait(timeout: deadline) == .timedOut {
+        timedOut = true
         log("run: \(path) timed out")
         reader.readabilityHandler = nil
         p.terminate() // Foundation signals only its own, still-unreaped child
@@ -144,6 +146,7 @@ func run(_ path: String, _ args: [String], timeout: TimeInterval? = 30) -> Strin
         if p.isRunning { kill(p.processIdentifier, SIGKILL) } // ignored SIGTERM
     }
     p.waitUntilExit()
+    if timedOut { return "" } // partial output isn't trusted, e.g. a state printed before a hang
     lock.lock(); defer { lock.unlock() }
     return String(decoding: data, as: UTF8.self)
 }
@@ -520,7 +523,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DistributedNotificationCenter.default().addObserver(forName: commandNotification, object: nil, queue: .main) { [weak self] n in
             guard let self, let cmd = n.object as? String else { return }
             log("app: command \(cmd)")
-            run(command: cmd, tries: 2)
+            // Disconnect needs no state, and starting it now beats an auto-connect check in flight.
+            if cmd == "disconnect" { return disconnect() }
+            run(command: cmd)
         }
     }
 
@@ -529,17 +534,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMenu()
     }
 
-    /// Runs a command on Cisco's current state, not the last poll. A check overtaken by a
-    /// newer one is retried; one overtaken by a connect or disconnect drops the command.
-    func run(command cmd: String, tries: Int) {
+    /// Runs a command on Cisco's current state, not the last poll. A connect or disconnect
+    /// that starts or ends meanwhile drops the command.
+    func run(command cmd: String) {
         checkState { s in
-            guard let s else {
-                if self.busy == nil, tries > 1 { return self.run(command: cmd, tries: tries - 1) }
-                return log("app: command \(cmd) dropped, the VPN state changed")
-            }
+            guard let s else { return log("app: command \(cmd) dropped, the VPN state changed") }
             switch cmd {
             case "connect": self.connect()
-            case "disconnect": self.disconnect()
             case "toggle" where s == "Unknown":
                 self.notify("Couldn't read the VPN state", "Choose Connect or Disconnect in the menu.")
             case "toggle": self.isActive ? self.disconnect() : self.connect()
@@ -553,8 +554,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func refresh() { checkState { _ in } }
 
     /// Checks Cisco's state off the main thread, applies it, and calls `done` on the main
-    /// thread with it. Calls `done` with nil instead if the result is out of date: a VPN
-    /// operation is running or started or ended meanwhile, or a newer check got in first.
+    /// thread with it. Calls `done` with nil instead if a VPN operation is running or started
+    /// or ended meanwhile. If a newer check got in first, `done` gets its result.
     /// A non-nil result is always `state`.
     func checkState(_ done: @escaping (String?) -> Void) {
         guard busy == nil else { return done(nil) }
@@ -565,7 +566,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard self.busy == nil, epoch == self.operationEpoch else { return done(nil) }
                 // An older check finishing late can't undo a newer one.
-                guard check > self.lastCheckApplied else { return done(nil) }
+                guard check > self.lastCheckApplied else { return done(self.state) }
                 self.lastCheckApplied = check
                 if s != self.state { self.state = s; self.render() } // unchanged: leave the open menu alone
                 done(s)
@@ -771,20 +772,23 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.render() // the checkmark in Auto-Connect Networks
                 guard let net = self.savedNetworks.first(where: { $0.router == router }) else { return }
                 log("auto: joined saved network \"\(net.name)\"")
-                self.autoConnect(router: router, generation: generation)
+                self.autoConnect(router: router)
             }
         }
     }
 
     /// The one connect attempt for joining a saved network, made only if a fresh state check
     /// says the VPN is off and nothing else happened since the join: no connect or disconnect,
-    /// no other network change, no update. Otherwise the join is dropped, never kept for later.
-    func autoConnect(router: String, generation: Int) {
+    /// no move to another network, no update, the network still saved. Otherwise the join is
+    /// dropped, never kept for later.
+    func autoConnect(router: String) {
         let skip = { (why: String) in log("auto: not connecting, \(why)") }
         guard !actedSinceNetworkChange else { return skip("a connect or disconnect already ran") }
         guard updating == nil else { return skip("an update is installing") }
         checkState { s in
-            guard generation == self.networkGeneration, router == self.currentRouter else { return skip("the network changed") }
+            // Not the generation: path updates on the same network (DNS, IPv6, the VPN) bump it.
+            guard router == self.currentRouter else { return skip("the network changed") }
+            guard self.savedNetworks.contains(where: { $0.router == router }) else { return skip("the network was removed") }
             guard !self.actedSinceNetworkChange, self.updating == nil, let s else { return skip("something else happened first") }
             guard s == "Disconnected" else { return skip("the VPN is \(s)") }
             guard Keychain.read(account: self.prefs.user) != nil else { return skip("no saved password") } // never prompt unasked
